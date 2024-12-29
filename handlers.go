@@ -22,8 +22,11 @@ type Server struct {
 	CPUProfile       string
 	TLSKey           string
 	TLSCert          string
+	TLSCaCert        string
 	TLS              bool
+	MTLS             bool
 	NoAuth           bool
+	NoMtlsAuth       bool
 	AppendOnly       bool
 	PrivateRepos     bool
 	Prometheus       bool

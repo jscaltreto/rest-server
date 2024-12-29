@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log"
@@ -59,9 +60,12 @@ func newRestServerApp() *restServerApp {
 	flags.Int64Var(&rv.Server.MaxRepoSize, "max-size", rv.Server.MaxRepoSize, "the maximum size of the repository in bytes")
 	flags.StringVar(&rv.Server.Path, "path", rv.Server.Path, "data directory")
 	flags.BoolVar(&rv.Server.TLS, "tls", rv.Server.TLS, "turn on TLS support")
+	flags.BoolVar(&rv.Server.MTLS, "mtls", rv.Server.MTLS, "turn on mTLS support")
 	flags.StringVar(&rv.Server.TLSCert, "tls-cert", rv.Server.TLSCert, "TLS certificate path")
 	flags.StringVar(&rv.Server.TLSKey, "tls-key", rv.Server.TLSKey, "TLS key path")
+	flags.StringVar(&rv.Server.TLSCaCert, "tls-ca-cert", rv.Server.TLSCaCert, "TLS CA certificate path for mTLS")
 	flags.BoolVar(&rv.Server.NoAuth, "no-auth", rv.Server.NoAuth, "disable .htpasswd authentication")
+	flags.BoolVar(&rv.Server.NoMtlsAuth, "no-mtls-auth", rv.Server.NoMtlsAuth, "disable mTLS authentication when mTLS is enabled")
 	flags.StringVar(&rv.Server.HtpasswdPath, "htpasswd-file", rv.Server.HtpasswdPath, "location of .htpasswd file (default: \"<data directory>/.htpasswd)\"")
 	flags.BoolVar(&rv.Server.NoVerifyUpload, "no-verify-upload", rv.Server.NoVerifyUpload,
 		"do not verify the integrity of uploaded data. DO NOT enable unless the rest-server runs on a very low-power device")
@@ -75,24 +79,41 @@ func newRestServerApp() *restServerApp {
 
 var version = "0.13.0"
 
-func (app *restServerApp) tlsSettings() (bool, string, string, error) {
-	var key, cert string
-	if !app.Server.TLS && (app.Server.TLSKey != "" || app.Server.TLSCert != "") {
-		return false, "", "", errors.New("requires enabled TLS")
+func (app *restServerApp) tlsSettings() (*tlsSettings, error) {
+	t := &tlsSettings{}
+	tlsRequired := app.Server.TLSKey != "" || app.Server.TLSCert != "" || app.Server.TLSCaCert != ""
+	if !app.Server.TLS && tlsRequired {
+		return nil, errors.New("requires enabled TLS")
+	} else if !app.Server.TLS && app.Server.MTLS {
+		return nil, errors.New("mTLS requires TLS to be enabled")
 	} else if !app.Server.TLS {
-		return false, "", "", nil
+		return t, nil
 	}
+	t.enabled = true
+
 	if app.Server.TLSKey != "" {
-		key = app.Server.TLSKey
+		t.key = app.Server.TLSKey
 	} else {
-		key = filepath.Join(app.Server.Path, "private_key")
+		t.key = filepath.Join(app.Server.Path, "private_key")
 	}
 	if app.Server.TLSCert != "" {
-		cert = app.Server.TLSCert
+		t.cert = app.Server.TLSCert
 	} else {
-		cert = filepath.Join(app.Server.Path, "public_key")
+		t.cert = filepath.Join(app.Server.Path, "public_key")
 	}
-	return app.Server.TLS, key, cert, nil
+
+	if !app.Server.MTLS && app.Server.TLSCaCert != "" {
+		return nil, errors.New("CA cert provided but mTLS not enabled")
+	}
+	if app.Server.MTLS {
+		if app.Server.TLSCaCert != "" {
+			t.caCert = app.Server.TLSCaCert
+		} else {
+			t.caCert = filepath.Join(app.Server.Path, "ca_cert")
+		}
+	}
+
+	return t, nil
 }
 
 // returns the address that the app is listening on.
@@ -124,6 +145,15 @@ func (app *restServerApp) runRoot(cmd *cobra.Command, args []string) error {
 		defer log.Println("Stopped CPU profiling")
 	}
 
+	if app.Server.MTLS {
+		if app.Server.NoMtlsAuth {
+			log.Println("mTLS authentication disabled")
+		} else {
+			log.Println("mTLS authentication enabled")
+			app.Server.NoAuth = false
+		}
+	}
+
 	if app.Server.NoAuth {
 		log.Println("Authentication disabled")
 	} else {
@@ -147,7 +177,7 @@ func (app *restServerApp) runRoot(cmd *cobra.Command, args []string) error {
 		log.Println("Private repositories disabled")
 	}
 
-	enabledTLS, privateKey, publicKey, err := app.tlsSettings()
+	tlsSettings, err := app.tlsSettings()
 	if err != nil {
 		return err
 	}
@@ -162,18 +192,28 @@ func (app *restServerApp) runRoot(cmd *cobra.Command, args []string) error {
 	app.listenerAddress = listener.Addr()
 	app.listenerAddressMu.Unlock()
 
+	// Configure TLS listener if enabled
+	if tlsSettings.enabled {
+		tlsConfig, err := tlsSettings.config()
+		if err != nil {
+			return fmt.Errorf("unable to create TLS config: %w", err)
+		}
+		log.Printf("TLS enabled, private key %s, pubkey %v", tlsSettings.key, tlsSettings.cert)
+		listener = tls.NewListener(listener, tlsConfig)
+		if tlsSettings.caCert != "" {
+			log.Printf("mTLS enabled, CA cert %s", tlsSettings.caCert)
+		}
+	}
+
 	srv := &http.Server{
 		Handler: handler,
 	}
 
 	// run server in background
+	done := make(chan struct{})
 	go func() {
-		if !enabledTLS {
-			err = srv.Serve(listener)
-		} else {
-			log.Printf("TLS enabled, private key %s, pubkey %v", privateKey, publicKey)
-			err = srv.ServeTLS(listener, publicKey, privateKey)
-		}
+		defer close(done)
+		err := srv.Serve(listener)
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("listen and serve returned err: %v", err)
 		}
@@ -186,6 +226,7 @@ func (app *restServerApp) runRoot(cmd *cobra.Command, args []string) error {
 	if err := srv.Shutdown(context.Background()); err != nil {
 		return fmt.Errorf("server shutdown returned an err: %w", err)
 	}
+	<-done
 
 	log.Println("shutdown cleanly")
 	return nil

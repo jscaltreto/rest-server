@@ -41,6 +41,13 @@ func (s *Server) checkAuth(r *http.Request) (username string, ok bool) {
 	if s.NoAuth {
 		return username, true
 	}
+
+	// If mTLS auth is enabled, use the CommonName from the client certificate
+	if s.MTLS && !s.NoMtlsAuth && r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+		username = r.TLS.PeerCertificates[0].Subject.CommonName
+		return username, true
+	}
+
 	var password string
 	username, password, ok = r.BasicAuth()
 	if !ok || !s.htpasswdFile.Validate(username, password) {
@@ -66,7 +73,7 @@ func (s *Server) wrapMetricsAuth(f http.HandlerFunc) http.HandlerFunc {
 
 // NewHandler returns the master HTTP multiplexer/router.
 func NewHandler(server *Server) (http.Handler, error) {
-	if !server.NoAuth {
+	if !server.NoAuth && !(server.MTLS && !server.NoMtlsAuth) {
 		var err error
 		if server.HtpasswdPath == "" {
 			server.HtpasswdPath = filepath.Join(server.Path, ".htpasswd")
